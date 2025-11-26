@@ -52,8 +52,8 @@ class PollBot:
                     data = json.load(f)
                 self.user_channels = {int(k): v for k, v in data.get("user_channels", {}).items()}
                 self.user_format = {int(k): v for k, v in data.get("user_format", {}).items()}
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"_load_data error: {e}")
 
     def _save_data(self):
         try:
@@ -63,8 +63,8 @@ class PollBot:
             }
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"_save_data error: {e}")
 
     # ---------------------- Helpers ----------------------
     def normalize_chat_id(self, raw):
@@ -73,7 +73,7 @@ class PollBot:
         except:
             return raw
 
-    # ---------------------- Parsing (supports both formats) ----------------------
+    # ---------------------- Parsing (supports both formats + CSV) ----------------------
     def parse_mcq_text(self, text):
         """
         Supports:
@@ -180,6 +180,173 @@ class PollBot:
 
         return polls
 
+    def parse_csv_text(self, text, strip_html=False):
+        """
+        Read CSV text and convert rows to poll dicts compatible with existing logic.
+        Handles headers (case-insensitive) like:
+        questions,option1,option2,option3,option4,option5,answer,explanation,type,section
+
+        - answer can be A/B/C... or 1/2/3...
+        - supports quoted fields with commas
+        - returns list of polls: {question, options(list), correct_answer (0-based int), explanation}
+        - strip_html: if True, HTML tags will be removed from question/explanation/options
+        """
+        import csv
+        from io import StringIO
+
+        polls = []
+
+        def clean_html(s):
+            if s is None:
+                return ""
+            s = str(s).strip()
+            if not s:
+                return ""
+            if strip_html:
+                return re.sub(r'<[^>]+>', '', s).strip()
+            return s
+
+        f = StringIO(text)
+        try:
+            reader = csv.DictReader(f)
+        except Exception:
+            # fallback to simple parsing
+            f.seek(0)
+            simple = csv.reader(f)
+            for row in simple:
+                if len(row) < 6:
+                    continue
+                q = clean_html(row[0])
+                opts = [clean_html(row[i]) for i in range(1, min(6, len(row)))]
+                # ensure at least 4 options
+                while len(opts) < 4:
+                    opts.append("")
+                ans_raw = row[6].strip() if len(row) > 6 else ""
+                expl = clean_html(row[7]) if len(row) > 7 else ""
+
+                # normalize answer
+                correct_index = None
+                if ans_raw:
+                    if ans_raw.isdigit():
+                        try:
+                            correct_index = int(ans_raw) - 1
+                        except:
+                            correct_index = None
+                    else:
+                        a = ans_raw.strip().upper()
+                        if a and a[0] in "ABCDE":
+                            correct_index = ord(a[0]) - ord('A')
+                if correct_index is None or correct_index < 0 or correct_index >= len(opts):
+                    continue
+
+                polls.append({
+                    "question": q or "(No question text)",
+                    "options": opts[:4],
+                    "correct_answer": correct_index,
+                    "explanation": expl
+                })
+
+            return polls
+
+        # If using DictReader
+        fieldnames = {fn.lower().strip(): fn for fn in (reader.fieldnames or [])}
+
+        # helper lists for header keys
+        q_keys = ['questions', 'question', 'q']
+        opt_keys = [f'option{i}' for i in range(1, 6)]
+        ans_keys = ['answer', 'ans', 'correct', 'correct answer', 'correct_answer']
+        expl_keys = ['explanation', 'explain', 'explanation_text', 'explaination']
+
+        for row in reader:
+            # find question column
+            q_col = None
+            for k in q_keys:
+                if k in fieldnames:
+                    q_col = fieldnames[k]
+                    break
+            if not q_col:
+                # fallback to first column
+                if reader.fieldnames and len(reader.fieldnames) > 0:
+                    q_col = reader.fieldnames[0]
+                else:
+                    continue
+
+            question = clean_html(row.get(q_col, "") or "")
+
+            # gather options
+            opts = []
+            for i in range(1, 6):
+                name = f'option{i}'
+                candidate = fieldnames.get(name)
+                if candidate:
+                    val = clean_html(row.get(candidate, "") or "")
+                    opts.append(val)
+
+            # positional fallback if no option headers matched
+            if not any(opts):
+                try:
+                    cols = reader.fieldnames
+                    q_idx = cols.index(q_col)
+                    for j in range(q_idx + 1, min(q_idx + 6, len(cols))):
+                        opts.append(clean_html(row.get(cols[j], "") or ""))
+                except Exception:
+                    pass
+
+            # ensure at least 4 options
+            while len(opts) < 4:
+                opts.append("")
+
+            # find answer
+            ans_col = None
+            for k in ans_keys:
+                if k in fieldnames:
+                    ans_col = fieldnames[k]
+                    break
+
+            ans_raw = (row.get(ans_col, "") or "").strip() if ans_col else ""
+
+            # heuristic: if ans_raw empty, try to find any small cell that looks like answer
+            if not ans_raw:
+                for fn in reader.fieldnames:
+                    v = (row.get(fn, "") or "").strip()
+                    if v and (v.isdigit() or (len(v) <= 3 and any(ch.isalpha() for ch in v))):
+                        if len(v) < 6:
+                            ans_raw = v
+                            break
+
+            correct_index = None
+            if ans_raw:
+                a = ans_raw.strip().upper()
+                m = re.match(r'^([A-E])', a)
+                if m:
+                    correct_index = ord(m.group(1)) - ord('A')
+                else:
+                    digits = re.search(r'\d+', a)
+                    if digits:
+                        try:
+                            correct_index = int(digits.group(0)) - 1
+                        except:
+                            correct_index = None
+
+            expl_col = None
+            for k in expl_keys:
+                if k in fieldnames:
+                    expl_col = fieldnames[k]
+                    break
+            explanation = clean_html(row.get(expl_col, "") or "") if expl_col else ""
+
+            if correct_index is None or correct_index < 0 or correct_index >= len(opts):
+                continue
+
+            polls.append({
+                "question": question or "(No question text)",
+                "options": opts[:4],
+                "correct_answer": correct_index,
+                "explanation": explanation
+            })
+
+        return polls
+
     # ---------------------- Formatting ----------------------
     def format_question(self, q, uid):
         prefix = self.user_format.get(uid, {}).get("prefix", "")
@@ -201,16 +368,34 @@ class PollBot:
                     await asyncio.sleep(DELAY_BETWEEN_POLLS - d)
 
                 q = self.format_question(poll["question"], uid)
-                ex = self.format_explanation(poll["explanation"], uid)
+                ex = self.format_explanation(poll.get("explanation", ""), uid)
+
+                # filter out empty options but keep order and map correct index accordingly
+                opts = [o for o in poll["options"] if o and o.strip()]
+                if len(opts) < 2:
+                    logger.error("Not enough non-empty options to send poll")
+                    return False
+
+                # If some options were empty, we need to map the correct option to the new index
+                original_opts = poll["options"]
+                orig_correct = poll["correct_answer"]
+                # find which non-empty option corresponds to original correct
+                non_empty_indices = [i for i, o in enumerate(original_opts) if o and o.strip()]
+                if orig_correct in non_empty_indices:
+                    new_correct = non_empty_indices.index(orig_correct)
+                else:
+                    # original correct option got removed or invalid -> choose first as fallback
+                    new_correct = 0
 
                 await ctx.bot.send_poll(
                     chat_id=chat,
                     question=q,
-                    options=poll["options"],
+                    options=opts,
                     type="quiz",
-                    correct_option_id=poll["correct_answer"],
-                    explanation=ex,
-                    is_anonymous=True
+                    correct_option_id=new_correct,
+                    explanation=ex or None,
+                    is_anonymous=True,
+                    explanation_parse_mode='HTML' if ex else None
                 )
 
                 self.last_poll_time = time.time()
@@ -337,6 +522,9 @@ D)
 
 Ans: A
 Explanation: ...
+
+অথবা CSV ফরম্যাটও পাঠাতে পারেন:
+Question,Option1,Option2,Option3,Option4,Option5,Answer,Explanation
 """
         await u.message.reply_text(welcome)
 
@@ -366,7 +554,33 @@ Explanation: ...
 
     async def handle_text(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         uid = u.effective_user.id
-        text = u.message.text
+        text = u.message.text or ""
+
+        # ---------------- CSV detection ----------------
+        first_line = text.splitlines()[0] if text.strip() else ""
+        if first_line:
+            lower_first = first_line.lower()
+            if (',' in first_line and (any(h in lower_first for h in ['question', 'questions', 'option1']) or lower_first.startswith('questions'))):
+                polls = self.parse_csv_text(text, strip_html=False)
+                if not polls:
+                    await u.message.reply_text("❌ CSV পার্স করা যায়নি — ফরম্যাট পরীক্ষা করুন।")
+                    return
+
+                for p in polls:
+                    self.poll_queue.append({"owner_user_id": uid, "poll_data": p})
+
+                total = len(polls)
+                batches = (total - 1) // POLLS_PER_BATCH + 1
+                est_seconds = total * DELAY_BETWEEN_POLLS + max(0, batches - 1) * BREAK_BETWEEN_BATCHES
+                est_min = est_seconds // 60
+                est_sec = est_seconds % 60
+
+                await u.message.reply_text(
+                    f"📁 CSV detected!\n✓ Loaded {total} polls.\nAdded to queue!\nWill be sent in {batches} batch(es)\n⏱ Estimated time: ~{est_min} min {est_sec} sec\nStarting to send..."
+                )
+
+                await self.process_queue(c, uid)
+                return
 
         # quick sanity check for required keywords (either style)
         if not re.search(r'(?i)Question', text) or not re.search(r'(?i)(Correct\s*Answer|Ans|Answer)', text):
@@ -398,7 +612,7 @@ Explanation: ...
             f"Starting to send..."
         )
 
-        # start processing (non-blocking because process_queue awaits but called here)
+        # start processing
         await self.process_queue(c, uid)
 
     # ---------------------- Setup ----------------------
