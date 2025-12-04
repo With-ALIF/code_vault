@@ -5,19 +5,18 @@ import json
 import os
 import logging
 from collections import deque
+from io import BytesIO
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.error import RetryAfter, TimedOut, Forbidden, BadRequest
+from telegram.error import RetryAfter, BadRequest, Forbidden
 
 # ================= BOT TOKEN =================
 BOT_TOKEN = '8279532303:AAE7YuydI5MRB68P7aRnI74d6RFlom2sJas'
 # =============================================
 
 # --------- CLEAN LOGGING (NO CONSOLE NOISE) ----------
-logging.basicConfig(
-    level=logging.ERROR,
-    format="%(message)s"
-)
+logging.basicConfig(level=logging.ERROR, format="%(message)s")
 logger = logging.getLogger(__name__)
 # -----------------------------------------------------
 
@@ -27,6 +26,10 @@ BREAK_BETWEEN_BATCHES = 5
 RETRY_ATTEMPTS = 3
 DATA_FILE = "sot_bot_user_data.json"
 
+# safe limits for fallback truncation (you can tune)
+FALLBACK_QUESTION_LIMIT = 1000
+FALLBACK_OPTION_LIMIT = 300
+FALLBACK_EXPLANATION_LIMIT = 2000
 
 class PollBot:
     def __init__(self, token):
@@ -73,7 +76,7 @@ class PollBot:
         except:
             return raw
 
-    # ---------------------- Parsing (supports both formats + CSV) ----------------------
+    # ---------------------- Parsing (your original functions kept intact) ----------------------
     def parse_mcq_text(self, text):
         """
         Supports:
@@ -360,42 +363,51 @@ class PollBot:
 
     # ---------------------- Poll Sending ----------------------
     async def send_single_poll(self, ctx, poll, idx, total, chat, uid):
+        """
+        Attempt to send poll preserving original message content.
+        If Telegram rejects due to length or entities, fallback:
+         - upload the ORIGINAL full text as a .txt document to the same chat (so nothing is lost)
+         - send a safe/truncated poll so the channel still gets a poll
+        """
+        # Keep original unmodified texts
+        q_original = self.format_question(poll["question"], uid)
+        ex_original = self.format_explanation(poll.get("explanation", ""), uid)
+        original_opts = list(poll["options"])
 
-        for _ in range(RETRY_ATTEMPTS):
+        # make options list (non-empty)
+        opts = [o for o in original_opts if o is not None and str(o).strip() != ""]
+        if len(opts) < 2:
+            logger.error("Not enough non-empty options to send poll")
+            return False
+
+        # compute mapping for correct option
+        orig_correct = poll.get("correct_answer", 0)
+        non_empty_indices = [i for i, o in enumerate(original_opts) if o and str(o).strip()]
+        if orig_correct in non_empty_indices:
+            new_correct = non_empty_indices.index(orig_correct)
+        else:
+            new_correct = 0
+
+        # Try to send as-is (no forced parse mode) to avoid entity parse errors.
+        # This preserves the exact text the user provided (including HTML tags).
+        for attempt in range(RETRY_ATTEMPTS):
             try:
+                # rate limiting between polls
                 d = time.time() - self.last_poll_time
                 if d < DELAY_BETWEEN_POLLS:
                     await asyncio.sleep(DELAY_BETWEEN_POLLS - d)
 
-                q = self.format_question(poll["question"], uid)
-                ex = self.format_explanation(poll.get("explanation", ""), uid)
-
-                # filter out empty options but keep order and map correct index accordingly
-                opts = [o for o in poll["options"] if o and o.strip()]
-                if len(opts) < 2:
-                    logger.error("Not enough non-empty options to send poll")
-                    return False
-
-                # If some options were empty, we need to map the correct option to the new index
-                original_opts = poll["options"]
-                orig_correct = poll["correct_answer"]
-                # find which non-empty option corresponds to original correct
-                non_empty_indices = [i for i, o in enumerate(original_opts) if o and o.strip()]
-                if orig_correct in non_empty_indices:
-                    new_correct = non_empty_indices.index(orig_correct)
-                else:
-                    # original correct option got removed or invalid -> choose first as fallback
-                    new_correct = 0
-
                 await ctx.bot.send_poll(
                     chat_id=chat,
-                    question=q,
+                    question=q_original,
                     options=opts,
                     type="quiz",
                     correct_option_id=new_correct,
-                    explanation=ex or None,
+                    explanation=ex_original or None,
                     is_anonymous=True,
-                    explanation_parse_mode='HTML' if ex else None
+                    # do NOT set explanation_parse_mode so Telegram won't try to parse HTML entities –
+                    # that way we keep the literal text intact (tags appear as plain text).
+                    explanation_parse_mode=None
                 )
 
                 self.last_poll_time = time.time()
@@ -403,6 +415,63 @@ class PollBot:
 
             except RetryAfter as e:
                 await asyncio.sleep(e.retry_after + 1)
+            except BadRequest as e:
+                err = str(e)
+                logger.error(f"send_single_poll BadRequest: {err}")
+
+                # If message too long or can't parse entities -> fallback
+                if 'Message is too long' in err or "Can't parse entities" in err or 'unsupported start tag' in err:
+                    # 1) Upload the original content as a .txt file to the target chat so nothing is lost.
+                    try:
+                        combined = "QUESTION:\n" + q_original + "\n\nOPTIONS:\n"
+                        for i, o in enumerate(original_opts):
+                            label = chr(ord('A') + i)
+                            combined += f"{label}. {o}\n"
+                        combined += "\nEXPLANATION:\n" + (ex_original or "")
+                        bio = BytesIO(combined.encode('utf-8'))
+                        bio.name = "original_poll.txt"
+                        await ctx.bot.send_document(chat_id=chat, document=bio, caption="Full original poll content (raw).")
+                    except Exception as doc_e:
+                        logger.error(f"Failed to send original content as document: {doc_e}")
+
+                    # 2) Prepare safe truncated versions for poll (so poll can be posted)
+                    q_safe = q_original
+                    ex_safe = ex_original
+                    safe_opts = list(opts)
+
+                    if len(q_safe) > FALLBACK_QUESTION_LIMIT:
+                        q_safe = q_safe[:FALLBACK_QUESTION_LIMIT-12].rstrip() + "\n\n[...truncated...]"
+                    # truncate options if required
+                    for i, o in enumerate(safe_opts):
+                        if len(o) > FALLBACK_OPTION_LIMIT:
+                            safe_opts[i] = o[:FALLBACK_OPTION_LIMIT-12].rstrip() + "..."
+                    if ex_safe and len(ex_safe) > FALLBACK_EXPLANATION_LIMIT:
+                        ex_safe = ex_safe[:FALLBACK_EXPLANATION_LIMIT-12].rstrip() + "\n\n[...truncated...]"
+
+                    # Try sending truncated poll (still without parse_mode)
+                    try:
+                        await ctx.bot.send_poll(
+                            chat_id=chat,
+                            question=q_safe,
+                            options=safe_opts,
+                            type="quiz",
+                            correct_option_id=new_correct if new_correct < len(safe_opts) else 0,
+                            explanation=ex_safe or None,
+                            is_anonymous=True,
+                            explanation_parse_mode=None
+                        )
+                        self.last_poll_time = time.time()
+                        return True
+                    except Exception as inner_e:
+                        logger.error(f"Fallback truncated poll failed: {inner_e}")
+                        return False
+                else:
+                    # other BadRequest types (e.g., chat not found, poll not allowed)
+                    logger.error(f"Unhandled BadRequest: {err}")
+                    return False
+            except Forbidden as e:
+                logger.error(f"Forbidden: {e}")
+                return False
             except Exception as e:
                 logger.error(f"send_single_poll error: {e}")
                 return False
@@ -424,7 +493,7 @@ class PollBot:
         # Collect polls belonging to this user; keep others in queue
         while self.poll_queue:
             item = self.poll_queue.popleft()
-            if item["owner_user_id"] == uid:
+            if item.get("owner_user_id") == uid:
                 my_polls.append(item["poll_data"])
             else:
                 others.append(item)
@@ -432,14 +501,20 @@ class PollBot:
         self.poll_queue = others
 
         if not my_polls:
-            await ctx.bot.send_message(uid, "❌ আপনার কিউতে কোনো পোল নেই।")
+            try:
+                await ctx.bot.send_message(uid, "❌ আপনার কিউতে কোনো পোল নেই।")
+            except Exception:
+                pass
             self.is_processing = False
             self.current_user_id = None
             return
 
         target = self.user_channels.get(uid)
         if not target:
-            await ctx.bot.send_message(uid, "❌ কোনো চ্যানেল সেট করা নেই। /setchannel ব্যবহার করুন।")
+            try:
+                await ctx.bot.send_message(uid, "❌ কোনো চ্যানেল সেট করা নেই। /setchannel ব্যবহার করুন।")
+            except Exception:
+                pass
             self.is_processing = False
             self.current_user_id = None
             return
@@ -448,14 +523,10 @@ class PollBot:
         sent = 0
 
         # Inform start of sending
-        await ctx.bot.send_message(uid, "Starting to send...")
-
-        # Calculate total batches for message/estimate
-        batches = (total - 1) // POLLS_PER_BATCH + 1
-        # Estimate: time for poll delays + breaks between batches
-        est_seconds = total * DELAY_BETWEEN_POLLS + max(0, batches - 1) * BREAK_BETWEEN_BATCHES
-        est_min = est_seconds // 60
-        est_sec = est_seconds % 60
+        try:
+            await ctx.bot.send_message(uid, "Starting to send...")
+        except Exception:
+            pass
 
         # Send in batches
         while my_polls:
@@ -463,19 +534,24 @@ class PollBot:
             my_polls = my_polls[POLLS_PER_BATCH:]
 
             for poll in batch:
-                if await self.send_single_poll(ctx, poll, sent + 1, total, target, uid):
+                ok = await self.send_single_poll(ctx, poll, sent + 1, total, target, uid)
+                if ok:
                     sent += 1
 
             if my_polls:
-                # pause message between batches
-                await ctx.bot.send_message(uid, f"⏸ {BREAK_BETWEEN_BATCHES}s বিরতি...")
+                try:
+                    await ctx.bot.send_message(uid, f"⏸ {BREAK_BETWEEN_BATCHES}s বিরতি...")
+                except Exception:
+                    pass
                 await asyncio.sleep(BREAK_BETWEEN_BATCHES)
 
-        # Final message (English as requested)
-        await ctx.bot.send_message(
-            uid,
-            f"✅ All done! Successfully sent {sent}/{total} polls to the channel."
-        )
+        try:
+            await ctx.bot.send_message(
+                uid,
+                f"✅ All done! Successfully sent {sent}/{total} polls to the channel."
+            )
+        except Exception:
+            pass
 
         self.is_processing = False
         self.current_user_id = None
@@ -526,35 +602,58 @@ Explanation: ...
 অথবা CSV ফরম্যাটও পাঠাতে পারেন:
 Question,Option1,Option2,Option3,Option4,Option5,Answer,Explanation
 """
-        await u.message.reply_text(welcome)
+        if u.message:
+            await u.message.reply_text(welcome)
+        else:
+            # fallback if message absent
+            if u.effective_user and u.effective_user.id:
+                await c.bot.send_message(u.effective_user.id, "Bot started. Use /start for instructions.")
 
     async def setchannel(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        uid = u.effective_user.id
+        uid = u.effective_user.id if u.effective_user else None
+        if uid is None:
+            return
         if not c.args:
-            await u.message.reply_text("ব্যবহার: /setchannel <channel_id_or_username>")
+            if u.message:
+                await u.message.reply_text("ব্যবহার: /setchannel <channel_id_or_username>")
             return
         raw = c.args[0]
         self.user_channels[uid] = self.normalize_chat_id(raw)
         self._save_data()
-        await u.message.reply_text(f"✅ Channel set: {raw}")
+        if u.message:
+            await u.message.reply_text(f"✅ Channel set: {raw}")
 
     async def setformat(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        uid = u.effective_user.id
+        uid = u.effective_user.id if u.effective_user else None
+        if uid is None:
+            return
         text = " ".join(c.args).strip()
 
         if "||" not in text:
-            await u.message.reply_text("ব্যবহার: /setformat <prefix> || <suffix>")
+            if u.message:
+                await u.message.reply_text("ব্যবহার: /setformat <prefix> || <suffix>")
             return
 
         prefix, suffix = text.split("||", 1)
         self.user_format[uid] = {"prefix": prefix.strip(), "suffix": suffix.strip()}
         self._save_data()
 
-        await u.message.reply_text("✅ Format saved!")
+        if u.message:
+            await u.message.reply_text("✅ Format saved!")
 
     async def handle_text(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        uid = u.effective_user.id
-        text = u.message.text or ""
+        # robust uid and text extraction
+        uid = u.effective_user.id if u.effective_user else None
+
+        text = ""
+        if u.message and u.message.text:
+            text = u.message.text
+        elif u.edited_message and u.edited_message.text:
+            text = u.edited_message.text
+        else:
+            if u.message:
+                await u.message.reply_text("No text found in update.")
+            return
 
         # ---------------- CSV detection ----------------
         first_line = text.splitlines()[0] if text.strip() else ""
@@ -563,10 +662,12 @@ Question,Option1,Option2,Option3,Option4,Option5,Answer,Explanation
             if (',' in first_line and (any(h in lower_first for h in ['question', 'questions', 'option1']) or lower_first.startswith('questions'))):
                 polls = self.parse_csv_text(text, strip_html=False)
                 if not polls:
-                    await u.message.reply_text("❌ CSV পার্স করা যায়নি — ফরম্যাট পরীক্ষা করুন।")
+                    if u.message:
+                        await u.message.reply_text("❌ CSV পার্স করা যায়নি — ফরম্যাট পরীক্ষা করুন।")
                     return
 
                 for p in polls:
+                    # do NOT modify the original texts — keep them as-is
                     self.poll_queue.append({"owner_user_id": uid, "poll_data": p})
 
                 total = len(polls)
@@ -575,53 +676,67 @@ Question,Option1,Option2,Option3,Option4,Option5,Answer,Explanation
                 est_min = est_seconds // 60
                 est_sec = est_seconds % 60
 
-                await u.message.reply_text(
-                    f"📁 CSV detected!\n✓ Loaded {total} polls.\nAdded to queue!\nWill be sent in {batches} batch(es)\n⏱ Estimated time: ~{est_min} min {est_sec} sec\nStarting to send..."
-                )
+                if u.message:
+                    await u.message.reply_text(
+                        f"📁 CSV detected!\n✓ Loaded {total} polls.\nAdded to queue!\nWill be sent in {batches} batch(es)\n⏱ Estimated time: ~{est_min} min {est_sec} sec\nStarting to send..."
+                    )
 
                 await self.process_queue(c, uid)
                 return
 
         # quick sanity check for required keywords (either style)
         if not re.search(r'(?i)Question', text) or not re.search(r'(?i)(Correct\s*Answer|Ans|Answer)', text):
-            await u.message.reply_text("❌ MCQ ফরম্যাট সঠিক নয় — 'Question' ও 'Ans/Correct Answer' থাকার কথা।")
+            if u.message:
+                await u.message.reply_text("❌ MCQ ফরম্যাট সঠিক নয় — 'Question' ও 'Ans/Correct Answer' থাকার কথা।")
             return
 
         polls = self.parse_mcq_text(text)
         if not polls:
-            await u.message.reply_text("❌ পোল তৈরি হয়নি (পার্সিং ব্যর্থ)। অনুগ্রহ করে ফরম্যাট পরীক্ষা করুন।")
+            if u.message:
+                await u.message.reply_text("❌ পোল তৈরি হয়নি (পার্সিং ব্যর্থ)। অনুগ্রহ করে ফরম্যাট পরীক্ষা করুন।")
             return
 
-        # Append polls to queue
+        # Append polls to queue (no modification of original messages)
         for p in polls:
             self.poll_queue.append({"owner_user_id": uid, "poll_data": p})
 
-        # Progress message(s)
         total = len(polls)
         batches = (total - 1) // POLLS_PER_BATCH + 1
         est_seconds = total * DELAY_BETWEEN_POLLS + max(0, batches - 1) * BREAK_BETWEEN_BATCHES
         est_min = est_seconds // 60
         est_sec = est_seconds % 60
 
-        await u.message.reply_text(
-            f"📊 Processing your polls...\n"
-            f"✓ Found {total} polls.\n\n"
-            f"Added to queue! 📦\n"
-            f"Will be sent in {batches} batch(es) of up to {POLLS_PER_BATCH} polls each\n"
-            f"⏱ Estimated time: ~{est_min} min {est_sec} sec\n"
-            f"Starting to send..."
-        )
+        if u.message:
+            await u.message.reply_text(
+                f"📊 Processing your polls...\n"
+                f"✓ Found {total} polls.\n\n"
+                f"Added to queue! 📦\n"
+                f"Will be sent in {batches} batch(es) of up to {POLLS_PER_BATCH} polls each\n"
+                f"⏱ Estimated time: ~{est_min} min {est_sec} sec\n"
+                f"Starting to send..."
+            )
 
         # start processing
         await self.process_queue(c, uid)
 
     # ---------------------- Setup ----------------------
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        # central error handler so Telegram exceptions don't crash your bot
+        try:
+            logger.error(f"Exception while handling an update: {context.error}")
+            # optionally notify admin
+        except Exception as ex:
+            logger.error(f"Error in error_handler: {ex}")
+
     def setup_handlers(self):
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("setchannel", self.setchannel))
         self.app.add_handler(CommandHandler("setformat", self.setformat))
 
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
+
+        # global error handler
+        self.app.add_error_handler(self.error_handler)
 
     # ---------------------- Run ----------------------
     def run(self):
